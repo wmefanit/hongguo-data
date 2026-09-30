@@ -1,0 +1,11 @@
+{
+  "name": "hongguo-data",
+  "version": "1.0.0",
+  "description": "红果短剧全库元数据矩阵构建与分发仓库",
+  "type": "module",
+  "scripts": {
+    "shard": "node scripts/build_shard.mjs",
+    "merge": "node scripts/merge_catalog.mjs"
+  },
+  "license": "MIT"
+}
