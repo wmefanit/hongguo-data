@@ -6,27 +6,26 @@
  *   https://hongguoduanju.com/player/<series_id>?__loader=player_(series_id)/page&__ssrDirect=true
  *   → 首段 JSON 的 seriesDetail：series_name / episode_cnt / series_cover / series_intro / tags / first_visible_time
  *
- * 说明：官方 player loader 不提供频道(真人剧/漫剧/AI剧)字段，因此本索引不写猜测频道，
- *      ch 字段仅保留给确实知道来源频道的条目（分类池/官方搜索回填）。
+ * 归因规则:
+ *   - found: 成功解析出 title、eps > 0 的完整卡片
+ *   - gone: 只有官方明确返回 404 / 410 时才计入（正常下架）；任何解析缺失、无标题、无集数一律算 invalid，不假装是已下架
+ *   - invalid: 解析失败、格式不对、无关键字段、网络失败重试仍失败
+ *   - unaccounted: 分配集合中尚未尝试的条目
+ *   - gap = unaccounted + invalid（所有未得到真实条目的缺口，无论何种原因）
+ *   - gap / assigned > 0.5% 时本片硬失败退出 1
  *
  * 用法:
  *   node scripts/build_shard.mjs --shard 1 [--part 0 --parts 4] [--limit N] [--concurrency 6] [--out-dir ./shards]
- *
- * 产物:
- *   <out-dir>/shard_<n>.json            条目数组（parts=1 时）
- *   <out-dir>/shard_<n>.part<p>.json    条目数组（parts>1 时）
- *   <out-dir>/shard_<n>[.part<p>]_report.json  { assigned, found, gone, invalid, error, missing... }
  */
 
-import fs from 'fs';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 const SITE = 'https://hongguoduanju.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// --parts/--concurrency/--limit：由 env 提供（workflow_dispatch 动态输入无法静态展开成 matrix，
-// 所以矩阵固定为 26 分片 × 4 part，动态参数通过 env 下发到脚本）
 const ENV_PARTS = Number(process.env.PARTS || 1);
 const ENV_LIMIT = Number(process.env.LIMIT || 0);
 const ENV_CONC = Number(process.env.CONC || 6);
@@ -35,10 +34,9 @@ function idToDate(id) {
   try { return new Date(Number(BigInt(id) >> 32n) * 1000).toISOString().slice(0, 10); } catch { return ''; }
 }
 
-// 受控时间戳：防非法值（如 future/NaN/极大）或 first_visible_time 异常导致整个 worker 崩溃
 function safeDate(ts, id) {
   const n = Number(ts);
-  if (Number.isFinite(n) && n > 0 && n < 4102444800) { // < 2100-01-01
+  if (Number.isFinite(n) && n > 0 && n < 4102444800) {
     try { return new Date(n * 1000).toISOString().slice(0, 10); } catch {}
   }
   return idToDate(id);
@@ -69,7 +67,6 @@ async function fetchText(url, { tries = 4, timeoutMs = 15000 } = {}) {
   return { ok: false, error: last || 'fetch failed' };
 }
 
-/** 下载分片 sitemap 并提取唯一 series_id（保持首次出现顺序，保证切片确定性） */
 async function getShardIds(shard) {
   const res = await fetchText(`${SITE}/sitemap/hongguoduanju/index${shard}.xml`, { tries: 5 });
   if (!res.ok) throw new Error(`Sitemap index${shard}.xml 下载失败: ${res.error || res.status}`);
@@ -125,36 +122,46 @@ async function main() {
   const per = Math.ceil(allIds.length / parts);
   let assigned = allIds.slice(part * per, (part + 1) * per);
   if (limit > 0) assigned = assigned.slice(0, limit);
-  // 断点文件以"分配集合指纹"为文件名的一部分：PARTS/LIMIT 变了则旧断点自动作废，避免分配集合变化后旧数据被误算成已覆盖
-  const assignedHash = require('node:crypto').createHash('sha1').update(assigned.join(',')).digest('hex').slice(0, 8);
+
+  // 指纹隔离：assigned 变化（如 limit 改了）旧断点自动作废
+  const assignedHash = createHash('sha1').update(assigned.join(',')).digest('hex').slice(0, 8);
   const suffix = parts > 1 ? `shard_${shard}.part${part}.${assignedHash}` : `shard_${shard}.${assignedHash}`;
   const outFile = path.join(outDir, `${suffix}.json`);
   const reportFile = path.join(outDir, `${suffix}_report.json`);
 
-  console.log(`[shard ${shard} part ${part}/${parts}] sitemap 唯一ID=${allIds.length} 本片分配=${assigned.length} 并发=${concurrency}`);
+  // 清除本 shard/part 属于旧指纹的文件，避免目录里残留历史条目混入合并
+  const stalePrefix = parts > 1 ? `shard_${shard}.part${part}.` : `shard_${shard}.`;
+  for (const name of fs.readdirSync(outDir)) {
+    if (name.startsWith(stalePrefix) && !name.startsWith(suffix)) {
+      if (name.endsWith('.json') || name.endsWith('_report.json')) {
+        try { fs.unlinkSync(path.join(outDir, name)); } catch {}
+      }
+    }
+  }
 
-  // 断点续跑：载入已有产物（仅限本片自己的历史文件）
+  console.log(`[shard ${shard} part ${part}/${parts}] sitemap 唯一ID=${allIds.length} 本片分配=${assigned.length} 指纹=${assignedHash} 并发=${concurrency}`);
+
   const found = new Map();
   const gone = new Set();
   const invalid = new Map();
   if (fs.existsSync(outFile)) {
     try {
       for (const it of JSON.parse(fs.readFileSync(outFile, 'utf8'))) if (it?.id) found.set(String(it.id), it);
-    } catch { /* 损坏则重建 */ }
+    } catch {}
   }
   if (fs.existsSync(reportFile)) {
     try {
       const prev = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
       for (const id of prev.goneIds || []) gone.add(String(id));
       for (const item of prev.invalidIds || []) invalid.set(String(item.id), item.reason);
-    } catch { /* 忽略 */ }
+    } catch {}
   }
 
   const attempted = new Set([...found.keys(), ...gone, ...invalid.keys()]);
   let pending = assigned.filter((id) => !attempted.has(id));
   console.log(`[shard ${shard} part ${part}] 已尝试=${attempted.size} 待抓=${pending.length} (found=${found.size} gone=${gone.size} invalid=${invalid.size})`);
 
-  let cursor = 0, errors = 0, lastSave = Date.now();
+  let cursor = 0, lastSave = Date.now();
   const started = Date.now();
   const tag = `[shard ${shard} part ${part}]`;
 
@@ -166,8 +173,7 @@ async function main() {
       found: found.size,
       gone: gone.size,
       invalid: invalid.size,
-      error: errors,
-      unaccounted: assigned.length - found.size - gone.size - invalid.size - errors,
+      unaccounted: assigned.length - found.size - gone.size - invalid.size,
       goneIds: [...gone],
       invalidIds: [...invalid].map(([id, reason]) => ({ id, reason })),
       elapsedSec: Math.round((Date.now() - started) / 1000),
@@ -184,18 +190,16 @@ async function main() {
       if (res.ok) {
         const parsed = parseCard(res.text, id);
         if (parsed.card) found.set(id, parsed.card);
-        else if (parsed.reason === 'no_title' || parsed.reason === 'no_episodes' || parsed.reason === 'no_seriesDetail') gone.add(id);
         else invalid.set(id, parsed.reason);
       } else if (res.gone) {
         gone.add(id);
-      // invalid 只记非网络类异常；网络类失败不写入 invalid，避免重试时双计
       } else {
         invalid.set(id, `net:${res.error || res.status}`);
       }
       if ((i + 1) % 200 === 0 || Date.now() - lastSave > 30000) {
         save();
         const rate = ((i + 1) / ((Date.now() - started) / 1000)).toFixed(1);
-        console.log(`${tag} ${i + 1}/${pending.length} found=${found.size} gone=${gone.size} err=${errors} ${rate} req/s`);
+        console.log(`${tag} ${i + 1}/${pending.length} found=${found.size} gone=${gone.size} invalid=${invalid.size} ${rate} req/s`);
         lastSave = Date.now();
       }
       await sleep(delayMs);
@@ -204,11 +208,11 @@ async function main() {
 
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
 
-  // 网络类失败重跑一轮（一次性，避免瞬时抖动计入 invalid）
+  // 网络类失败做一次集中重试
   const netFailed = [...invalid].filter(([, r]) => String(r).startsWith('net:'));
   if (netFailed.length) {
-    console.log(`${tag} 重试网络失败 ${netFailed.length} 条`);
-    for (const [id] of netFailed) invalid.delete(id); // 先清旧网络失败，避免重试期间双计
+    console.log(`${tag} 集中重试网络失败 ${netFailed.length} 条`);
+    for (const [id] of netFailed) invalid.delete(id);
     pending = netFailed.map(([id]) => id);
     cursor = 0;
     await Promise.all(Array.from({ length: 3 }, () => worker()));
@@ -217,16 +221,13 @@ async function main() {
 
   save();
   const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
-  console.log(`${tag} 完成: ${JSON.stringify({ assigned: report.assigned, found: report.found, gone: report.gone, invalid: report.invalid, unaccounted: report.unaccounted, elapsedSec: report.elapsedSec })}`);
-  // 覆盖率硬闸门：任何未解释（非 gone、非 invalid、非 found）都算缺口，> 0.5% 视为本片失败
-  const netRemain = [...invalid.values()].filter((r) => String(r).startsWith('net:')).length;
-  const unexplained = report.unaccounted + netRemain;
-  if (assigned.length > 0 && unexplained / assigned.length > 0.005) {
-    console.error(`${tag} 失败：未解释缺失 ${unexplained}/${assigned.length} 超过 0.5% 阈值`);
+  const failed = invalid.size;
+  const gap = report.unaccounted + failed;
+  console.log(`${tag} 完成: ${JSON.stringify({ assigned: report.assigned, found: report.found, gone: report.gone, invalid: report.invalid, unaccounted: report.unaccounted, gap, elapsedSec: report.elapsedSec })}`);
+  if (assigned.length > 0 && gap / assigned.length > 0.005) {
+    console.error(`${tag} 失败：缺口 ${gap}/${assigned.length}（未解释 ${report.unaccounted} + 失败/异常 ${failed}）超过 0.5% 阈值！`);
     process.exit(1);
   }
-  // 成功但有网络残余：标为软失败（不阻塞 release，但日志可看出健康度）
-  if (netRemain > 0) console.warn(`${tag} 警告：${netRemain} 条网络失败仍存入 invalid（会记入 unaccounted，合并时可见）`);
 }
 
 main().catch((e) => { console.error('FATAL:', e); process.exit(1); });
