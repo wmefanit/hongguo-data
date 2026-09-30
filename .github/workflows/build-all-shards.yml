@@ -1,6 +1,9 @@
 name: Build Full Catalog
 
 on:
+  schedule:
+    # 每天凌晨 03:00 (UTC 19:00) 自动定时构建全量全库
+    - cron: '0 19 * * *'
   workflow_dispatch:
     inputs:
       concurrency:
