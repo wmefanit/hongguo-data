@@ -1,0 +1,125 @@
+name: Build Full Catalog
+
+on:
+  workflow_dispatch:
+    inputs:
+      parts:
+        description: '每个 sitemap 分片再切成几个 part（26×parts 个 job）'
+        required: false
+        default: '4'
+      concurrency:
+        description: '单 job 并发请求数'
+        required: false
+        default: '6'
+      limit:
+        description: '实验用：每 part 只抓前 N 条（0 = 全量）'
+        required: false
+        default: '0'
+      publish:
+        description: '是否发布 Release（实验阶段填 false）'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: write
+
+jobs:
+  shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+        part: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Restore shard checkpoint
+        uses: actions/cache/restore@v4
+        with:
+          path: shards
+          key: hgdata-shard-${{ matrix.shard }}-${{ matrix.part }}-${{ github.ref_name }}
+
+      - name: Crawl shard ${{ matrix.shard }} part ${{ matrix.part }}
+        shell: bash
+        env:
+          PARTS: ${{ github.event.inputs.parts || '4' }}
+          CONC: ${{ github.event.inputs.concurrency || '6' }}
+          LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: |
+          set -o pipefail
+          ARGS="--shard ${{ matrix.shard }} --part ${{ matrix.part }} --parts $PARTS --concurrency $CONC --out-dir shards"
+          if [ "$LIMIT" != "0" ]; then ARGS="$ARGS --limit $LIMIT"; fi
+          node scripts/build_shard.mjs $ARGS 2>&1 | tee -a "shards_${{ matrix.shard }}_${{ matrix.part }}.log"
+
+      - name: Save shard checkpoint
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: shards
+          key: hgdata-shard-${{ matrix.shard }}-${{ matrix.part }}-${{ github.ref_name }}-${{ github.run_attempt }}
+
+      - name: Upload shard artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}-${{ matrix.part }}
+          path: |
+            shards/
+            shards_${{ matrix.shard }}_${{ matrix.part }}.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  merge:
+    needs: [shard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: shards
+          pattern: shard-*
+          merge-multiple: true
+
+      - name: Merge and verify (strict)
+        run: |
+          node scripts/merge_catalog.mjs --in-dir shards --out-dir dist
+
+      - name: Upload merged catalog artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: catalog-full
+          path: |
+            dist/catalog.json.gz
+            dist/summary.json
+          retention-days: 14
+
+      - name: Publish release
+        if: ${{ github.event.inputs.publish != 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="full-$(date -u +%Y%m%d)"
+          # 同一天重跑：先删旧 release 与 tag，保证幂等
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "全量索引 $TAG" \
+            --notes "覆盖 $(node -p "require('./dist/summary.json').catalog_total") 部；覆盖率 $(node -p "require('./dist/summary.json').coverage_rate")；生成时间 $(node -p "require('./dist/summary.json').updated_at")" \
+            --latest \
+            dist/catalog.json.gz dist/summary.json
