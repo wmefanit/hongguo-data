@@ -2,16 +2,20 @@ name: Build Full Catalog
 
 on:
   schedule:
-    # 每天凌晨 03:00 (UTC 19:00) 自动定时构建全量全库
+    # 每天凌晨 03:00 (UTC 19:00) 计划执行
     - cron: '0 19 * * *'
   workflow_dispatch:
     inputs:
+      mode:
+        description: '构建模式: incremental (增量优先) 或 full (强制全量)'
+        required: false
+        default: 'incremental'
       concurrency:
         description: '单 job 并发请求数'
         required: false
         default: '6'
       limit:
-        description: '实验用：每 part 只抓前 N 条（0 = 全量 55 万）'
+        description: '实验用：每 part 只抓前 N 条（0 = 全量）'
         required: false
         default: '0'
       publish:
@@ -23,7 +27,88 @@ permissions:
   contents: write
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      mode: ${{ steps.plan_step.outputs.mode }}
+      unchanged: ${{ steps.plan_step.outputs.unchanged }}
+      from_tag: ${{ steps.plan_step.outputs.from_tag }}
+      has_baseline: ${{ steps.plan_step.outputs.has_baseline }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Fetch latest baseline release assets
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p baseline
+          MODE="${{ github.event.inputs.mode || 'incremental' }}"
+          DOW=$(date -u +%w)
+          if [ "$MODE" = "full" ] || [ "$DOW" = "0" ]; then
+            echo "全量审计构建 (mode=$MODE, dow=$DOW)"
+            echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LATEST_TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          if [ -n "$LATEST_TAG" ]; then
+            echo "尝试拉取基线: $LATEST_TAG"
+            if gh release download "$LATEST_TAG" --repo "$GITHUB_REPOSITORY" --pattern "source_manifest.json.gz" --pattern "catalog.json.gz" --dir baseline --clobber; then
+              echo "has_baseline=true" >> "$GITHUB_OUTPUT"
+              echo "from_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+            else
+              echo "拉取基线失败，回退全量"
+              echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "未找到 Release，首次全量构建"
+            echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Planner
+        id: plan_step
+        run: |
+          mkdir -p plan_out
+          ARGS="--out-dir plan_out --parts 4"
+          if [ "${{ steps.base.outputs.has_baseline }}" = "true" ] && [ -f "baseline/source_manifest.json.gz" ]; then
+            ARGS="$ARGS --baseline-manifest baseline/source_manifest.json.gz --mode incremental"
+          else
+            ARGS="$ARGS --mode full"
+          fi
+          node scripts/plan_run.mjs $ARGS
+
+          MODE=$(node -p "require('./plan_out/plan.json').mode")
+          UNCHANGED=$(node -p "require('./plan_out/plan.json').unchanged")
+          FROM_TAG=$(node -p "require('./plan_out/plan.json').from_tag || ''")
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "unchanged=$UNCHANGED" >> "$GITHUB_OUTPUT"
+          echo "from_tag=$FROM_TAG" >> "$GITHUB_OUTPUT"
+          echo "has_baseline=${{ steps.base.outputs.has_baseline }}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-plan
+          path: plan_out/
+          retention-days: 2
+
+      - name: Upload baseline catalog if present
+        if: steps.base.outputs.has_baseline == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-catalog
+          path: baseline/catalog.json.gz
+          retention-days: 2
+
   shard:
+    needs: [plan]
+    if: needs.plan.outputs.unchanged != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
@@ -38,33 +123,24 @@ jobs:
         with:
           node-version: 20
 
-      - name: Restore shard checkpoint
-        uses: actions/cache/restore@v4
+      - name: Download plan
+        uses: actions/download-artifact@v4
         with:
-          path: shards
-          key: hgdata-shard-${{ matrix.shard }}-${{ matrix.part }}-${{ github.ref_name }}
-          restore-keys: |
-            hgdata-shard-${{ matrix.shard }}-${{ matrix.part }}-
+          name: crawl-plan
+          path: plan
 
       - name: Crawl shard ${{ matrix.shard }} part ${{ matrix.part }}
         shell: bash
         env:
-          PARTS: '4'
           CONC: ${{ github.event.inputs.concurrency || '6' }}
           LIMIT: ${{ github.event.inputs.limit || '0' }}
         run: |
           set -o pipefail
           mkdir -p shards
-          ARGS="--shard ${{ matrix.shard }} --part ${{ matrix.part }} --parts $PARTS --concurrency $CONC --out-dir shards"
+          PLAN_FILE="plan/plan_${{ matrix.shard }}_${{ matrix.part }}.json"
+          ARGS="--shard ${{ matrix.shard }} --part ${{ matrix.part }} --plan-file $PLAN_FILE --concurrency $CONC --out-dir shards"
           if [ "$LIMIT" != "0" ]; then ARGS="$ARGS --limit $LIMIT"; fi
           node scripts/build_shard.mjs $ARGS 2>&1 | tee -a "shard_${{ matrix.shard }}_${{ matrix.part }}.log"
-
-      - name: Save shard checkpoint
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: shards
-          key: hgdata-shard-${{ matrix.shard }}-${{ matrix.part }}-${{ github.ref_name }}-${{ github.run_id }}
 
       - name: Upload shard artifact
         if: always()
@@ -78,7 +154,8 @@ jobs:
           retention-days: 7
 
   merge:
-    needs: [shard]
+    needs: [plan, shard]
+    if: needs.plan.outputs.unchanged != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -88,7 +165,20 @@ jobs:
         with:
           node-version: 20
 
-      - name: Download all shard artifacts
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: crawl-plan
+          path: plan
+
+      - name: Download baseline catalog if present
+        if: needs.plan.outputs.has_baseline == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: baseline-catalog
+          path: baseline
+
+      - name: Download shard artifacts
         uses: actions/download-artifact@v4
         with:
           path: shards_raw
@@ -99,23 +189,21 @@ jobs:
         run: |
           mkdir -p shards
           find shards_raw -type f -name "*.json" -exec cp -f {} shards/ \;
-          echo "Flattened shard files count: $(ls shards/*.json | wc -l)"
+          echo "Shard files: $(ls shards/*.json | wc -l)"
 
-      - name: Merge and verify
-        env:
-          LIMIT: ${{ github.event.inputs.limit || '0' }}
+      - name: Merge and generate delta
         run: |
-          ARGS="--in-dir shards --out-dir dist"
-          if [ "$LIMIT" != "0" ]; then ARGS="$ARGS --skip-sitemap-fetch"; fi
+          ARGS="--plan-file plan/plan.json --in-dir shards --out-dir dist"
+          if [ -f "baseline/catalog.json.gz" ]; then
+            ARGS="$ARGS --baseline-catalog baseline/catalog.json.gz"
+          fi
           node scripts/merge_catalog.mjs $ARGS
 
-      - name: Upload merged catalog artifact
+      - name: Upload dist artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: catalog-full
-          path: |
-            dist/catalog.json.gz
-            dist/summary.json
+          name: catalog-dist
+          path: dist/
           retention-days: 14
 
       - name: Publish release
@@ -129,11 +217,17 @@ jobs:
             gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           fi
           TOTAL=$(node -p "require('./dist/summary.json').catalog_total")
-          COV=$(node -p "require('./dist/summary.json').coverage_rate")
           TIME=$(node -p "require('./dist/summary.json').updated_at")
+          NOTES="红果短剧全量+增量元数据索引 ($TOTAL 部)\n生成时间: $TIME"
+
+          FILES="dist/catalog.json.gz dist/summary.json dist/source_manifest.json.gz"
+          if [ -f "dist/catalog.delta.json.gz" ]; then
+            FILES="$FILES dist/catalog.delta.json.gz dist/delta.summary.json"
+          fi
+
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "全量索引 $TAG ($TOTAL 部)" \
-            --notes "本索引覆盖官方 Sitemap 全部 26 分片唯一剧集；有效入库 $TOTAL 部；基准覆盖率 $COV；生成时间 $TIME" \
+            --title "短剧索引 $TAG ($TOTAL 部)" \
+            --notes "$NOTES" \
             --latest \
-            dist/catalog.json.gz dist/summary.json
+            $FILES

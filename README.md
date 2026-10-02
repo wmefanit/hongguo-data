@@ -20,7 +20,8 @@
 
 ## 获取最新数据
 
-直接从 Releases 下载 `catalog.json.gz`：
+- **增量优先（推荐）**：Web 服务同步脚本 `sync_catalog.mjs` 会优先检查并下载 `catalog.delta.json.gz`（~1-3 MB）在内存打补丁。
+- **全量下载**：直接从 Releases 下载 `catalog.json.gz`（~80 MB）：
 
 ```bash
 curl -LO https://github.com/wmefanit/hongguo-data/releases/latest/download/catalog.json.gz
@@ -30,9 +31,12 @@ gzip -d catalog.json.gz
 ## 构建方法
 
 ```bash
-# 抓取单分片（支持再分 part）
-node scripts/build_shard.mjs --shard 1 --part 0 --parts 4 --concurrency 6
+# 增量抓取单分片（传入昨天的 catalog.json.gz 作为基线复用）
+node scripts/build_shard.mjs --shard 1 --part 0 --parts 4 --concurrency 6 --baseline ./baseline/catalog.json.gz
 
-# 合并所有分片并做严格基准校验
-node scripts/merge_catalog.mjs --in-dir ./shards --out-dir ./dist
+# 强制全量审计抓取单分片
+node scripts/build_shard.mjs --shard 1 --part 0 --parts 4 --concurrency 6 --full
+
+# 合并所有分片并生成全量 + Delta 增量包
+node scripts/merge_catalog.mjs --in-dir ./shards --out-dir ./dist --baseline-catalog ./baseline/catalog.json.gz --from-tag full-20261001 --to-tag full-20261002
 ```

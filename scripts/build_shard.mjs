@@ -1,45 +1,23 @@
 #!/usr/bin/env node
 /**
- * build_shard.mjs — 抓取红果短剧单个 Sitemap 分片（可再切 part）的剧集元数据
- *
- * 数据源（实测 52/52、100/100 解析成功）：
- *   https://hongguoduanju.com/player/<series_id>?__loader=player_(series_id)/page&__ssrDirect=true
- *   → 首段 JSON 的 seriesDetail：series_name / episode_cnt / series_cover / series_intro / tags / first_visible_time
- *
- * 归因规则:
- *   - found: 成功解析出 title、eps > 0 的完整卡片
- *   - gone: 只有官方明确返回 404 / 410 时才计入（正常下架）；任何解析缺失、无标题、无集数一律算 invalid，不假装是已下架
- *   - invalid: 解析失败、格式不对、无关键字段、网络失败重试仍失败
- *   - unaccounted: 分配集合中尚未尝试的条目
- *   - gap = unaccounted + invalid（所有未得到真实条目的缺口，无论何种原因）
- *   - gap / assigned > 0.5% 时本片硬失败退出 1
- *
- * 用法:
- *   node scripts/build_shard.mjs --shard 1 [--part 0 --parts 4] [--limit N] [--concurrency 6] [--out-dir ./shards]
+ * build_shard.mjs — 抓取规划器指定的任务项（零冗余抓取）
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { normalizeCover, safeDate, normalizeCard } from '../lib/catalog_util.js';
 
 const SITE = 'https://hongguoduanju.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const ENV_PARTS = Number(process.env.PARTS || 1);
-const ENV_LIMIT = Number(process.env.LIMIT || 0);
-const ENV_CONC = Number(process.env.CONC || 6);
-
-function idToDate(id) {
-  try { return new Date(Number(BigInt(id) >> 32n) * 1000).toISOString().slice(0, 10); } catch { return ''; }
+function arg(flag, fallback) {
+  const i = process.argv.indexOf(flag);
+  return i >= 0 && process.argv[i + 1] !== undefined ? process.argv[i + 1] : fallback;
 }
 
-function safeDate(ts, id) {
-  const n = Number(ts);
-  if (Number.isFinite(n) && n > 0 && n < 4102444800) {
-    try { return new Date(n * 1000).toISOString().slice(0, 10); } catch {}
-  }
-  return idToDate(id);
+function num(v, def) {
+  return Number.isFinite(Number(v)) ? Number(v) : def;
 }
 
 async function fetchText(url, { tries = 4, timeoutMs = 15000 } = {}) {
@@ -67,14 +45,6 @@ async function fetchText(url, { tries = 4, timeoutMs = 15000 } = {}) {
   return { ok: false, error: last || 'fetch failed' };
 }
 
-async function getShardIds(shard) {
-  const res = await fetchText(`${SITE}/sitemap/hongguoduanju/index${shard}.xml`, { tries: 5 });
-  if (!res.ok) throw new Error(`Sitemap index${shard}.xml 下载失败: ${res.error || res.status}`);
-  const locs = [...res.text.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
-  const ids = locs.map((l) => (l.match(/(?:\/player\/|series_id=)(\d+)/) || [])[1]).filter(Boolean);
-  return [...new Set(ids)];
-}
-
 function parseCard(text, id) {
   let base = null;
   try {
@@ -92,7 +62,7 @@ function parseCard(text, id) {
     card: {
       id,
       title,
-      cover: String(sd.series_cover || '').replace(/\\u002F/g, '/'),
+      cover: normalizeCover(sd.series_cover),
       intro: String(sd.series_intro || '').replace(/\s+/g, ' ').trim().slice(0, 50),
       tags,
       eps,
@@ -103,90 +73,78 @@ function parseCard(text, id) {
 }
 
 async function main() {
-  const args = process.argv.slice(2);
-  const arg = (flag, def) => { const i = args.indexOf(flag); return i >= 0 && args[i + 1] !== undefined ? args[i + 1] : def; };
-  const num = (v, def) => (Number.isFinite(Number(v)) ? Number(v) : def);
-
   const shard = num(arg('--shard', 0), 0);
-  if (!Number.isInteger(shard) || shard < 1 || shard > 26) { console.error('--shard 必须是 1..26'); process.exit(2); }
-  const parts = Math.max(1, num(arg('--parts', ENV_PARTS), ENV_PARTS));
   const part = num(arg('--part', 0), 0);
-  if (part < 0 || part >= parts) { console.error('--part 必须在 0..parts-1'); process.exit(2); }
-  const concurrency = Math.min(10, Math.max(1, num(arg('--concurrency', ENV_CONC), ENV_CONC)));
+  const planFile = arg('--plan-file', `./plan/plan_${shard}_${part}.json`);
+  const concurrency = Math.min(10, Math.max(1, num(arg('--concurrency', 6), 6)));
   const delayMs = num(arg('--delay', 80), 80);
-  const limit = num(arg('--limit', ENV_LIMIT), ENV_LIMIT);
-  const outDir = arg('--out-dir', './shards');
+  const limit = num(arg('--limit', 0), 0);
+  const site = arg('--site', SITE).replace(/\/$/, '');
+  const outDir = path.resolve(arg('--out-dir', './shards'));
   fs.mkdirSync(outDir, { recursive: true });
 
-  const allIds = await getShardIds(shard);
-  const per = Math.ceil(allIds.length / parts);
-  let assigned = allIds.slice(part * per, (part + 1) * per);
-  if (limit > 0) assigned = assigned.slice(0, limit);
-
-  // 指纹隔离：assigned 变化（如 limit 改了）旧断点自动作废
-  const assignedHash = createHash('sha1').update(assigned.join(',')).digest('hex').slice(0, 8);
-  const suffix = parts > 1 ? `shard_${shard}.part${part}.${assignedHash}` : `shard_${shard}.${assignedHash}`;
-  const outFile = path.join(outDir, `${suffix}.json`);
-  const reportFile = path.join(outDir, `${suffix}_report.json`);
-
-  // 清除本 shard/part 属于旧指纹的文件，避免目录里残留历史条目混入合并
-  const stalePrefix = parts > 1 ? `shard_${shard}.part${part}.` : `shard_${shard}.`;
-  for (const name of fs.readdirSync(outDir)) {
-    if (name.startsWith(stalePrefix) && !name.startsWith(suffix)) {
-      if (name.endsWith('.json') || name.endsWith('_report.json')) {
-        try { fs.unlinkSync(path.join(outDir, name)); } catch {}
-      }
-    }
+  if (!fs.existsSync(planFile)) {
+    throw new Error(`找不到 plan 文件: ${planFile}`);
   }
+  const plan = JSON.parse(fs.readFileSync(planFile, 'utf8'));
+  let items = plan.items || [];
+  if (limit > 0) items = items.slice(0, limit);
 
-  console.log(`[shard ${shard} part ${part}/${parts}] sitemap 唯一ID=${allIds.length} 本片分配=${assigned.length} 指纹=${assignedHash} 并发=${concurrency}`);
-
+  const outFile = path.join(outDir, `shard_${shard}.part${part}.json`);
+  const reportFile = path.join(outDir, `shard_${shard}.part${part}_report.json`);
   const found = new Map();
   const gone = new Set();
   const invalid = new Map();
+
+  // 断点恢复（仅当前任务集内的 ID）
+  const allowed = new Set(items.map((it) => it.id));
   if (fs.existsSync(outFile)) {
     try {
-      for (const it of JSON.parse(fs.readFileSync(outFile, 'utf8'))) if (it?.id) found.set(String(it.id), it);
+      for (const raw of JSON.parse(fs.readFileSync(outFile, 'utf8'))) {
+        const card = normalizeCard(raw);
+        if (card && allowed.has(card.id)) found.set(card.id, card);
+      }
     } catch {}
   }
   if (fs.existsSync(reportFile)) {
     try {
-      const prev = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
-      for (const id of prev.goneIds || []) gone.add(String(id));
-      for (const item of prev.invalidIds || []) invalid.set(String(item.id), item.reason);
+      const rep = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+      for (const id of rep.goneIds || []) if (allowed.has(String(id))) gone.add(String(id));
+      for (const it of rep.invalidIds || []) if (allowed.has(String(it.id))) invalid.set(String(it.id), it.reason);
     } catch {}
   }
 
   const attempted = new Set([...found.keys(), ...gone, ...invalid.keys()]);
-  let pending = assigned.filter((id) => !attempted.has(id));
-  console.log(`[shard ${shard} part ${part}] 已尝试=${attempted.size} 待抓=${pending.length} (found=${found.size} gone=${gone.size} invalid=${invalid.size})`);
+  const pending = items.filter((it) => !attempted.has(it.id));
+  console.log(`[shard ${shard} part ${part}] 分配=${items.length} 断点已恢复=${attempted.size} 需抓取=${pending.length} 并发=${concurrency}`);
 
-  let cursor = 0, lastSave = Date.now();
+  let cursor = 0;
   const started = Date.now();
-  const tag = `[shard ${shard} part ${part}]`;
+  let lastSave = Date.now();
 
   const save = () => {
     fs.writeFileSync(outFile, JSON.stringify([...found.values()]));
     fs.writeFileSync(reportFile, JSON.stringify({
-      shard, part, parts,
-      assigned: assigned.length,
+      shard,
+      part,
+      assigned: items.length,
       found: found.size,
       gone: gone.size,
       invalid: invalid.size,
-      unaccounted: assigned.length - found.size - gone.size - invalid.size,
+      unaccounted: items.length - found.size - gone.size - invalid.size,
       goneIds: [...gone],
       invalidIds: [...invalid].map(([id, reason]) => ({ id, reason })),
       elapsedSec: Math.round((Date.now() - started) / 1000),
       updatedAt: new Date().toISOString(),
-    }));
+    }, null, 2));
   };
 
   const worker = async () => {
     for (;;) {
       const i = cursor++;
       if (i >= pending.length) return;
-      const id = pending[i];
-      const res = await fetchText(`${SITE}/player/${id}?__loader=player_(series_id)/page&__ssrDirect=true`, { tries: 3, timeoutMs: 15000 });
+      const { id } = pending[i];
+      const res = await fetchText(`${site}/player/${id}?__loader=player_(series_id)/page&__ssrDirect=true`, { tries: 3, timeoutMs: 15000 });
       if (res.ok) {
         const parsed = parseCard(res.text, id);
         if (parsed.card) found.set(id, parsed.card);
@@ -198,36 +156,54 @@ async function main() {
       }
       if ((i + 1) % 200 === 0 || Date.now() - lastSave > 30000) {
         save();
-        const rate = ((i + 1) / ((Date.now() - started) / 1000)).toFixed(1);
-        console.log(`${tag} ${i + 1}/${pending.length} found=${found.size} gone=${gone.size} invalid=${invalid.size} ${rate} req/s`);
         lastSave = Date.now();
       }
       await sleep(delayMs);
     }
   };
 
-  await Promise.all(Array.from({ length: concurrency }, () => worker()));
-
-  // 网络类失败做一次集中重试
-  const netFailed = [...invalid].filter(([, r]) => String(r).startsWith('net:'));
-  if (netFailed.length) {
-    console.log(`${tag} 集中重试网络失败 ${netFailed.length} 条`);
-    for (const [id] of netFailed) invalid.delete(id);
-    pending = netFailed.map(([id]) => id);
-    cursor = 0;
-    await Promise.all(Array.from({ length: 3 }, () => worker()));
-    for (const [id, r] of netFailed) if (!found.has(id) && !gone.has(id)) invalid.set(id, r);
+  if (pending.length > 0) {
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    // 网络错误集中重试一次
+    const netFailed = [...invalid].filter(([, r]) => String(r).startsWith('net:'));
+    if (netFailed.length > 0) {
+      console.log(`[shard ${shard} part ${part}] 重试网络失败 ${netFailed.length} 条`);
+      for (const [id] of netFailed) invalid.delete(id);
+      const retryItems = netFailed.map(([id]) => ({ id }));
+      cursor = 0;
+      await Promise.all(Array.from({ length: 3 }, async () => {
+        for (;;) {
+          const idx = cursor++;
+          if (idx >= retryItems.length) return;
+          const { id } = retryItems[idx];
+          const res = await fetchText(`${site}/player/${id}?__loader=player_(series_id)/page&__ssrDirect=true`, { tries: 3, timeoutMs: 15000 });
+          if (res.ok) {
+            const parsed = parseCard(res.text, id);
+            if (parsed.card) found.set(id, parsed.card);
+            else invalid.set(id, parsed.reason);
+          } else if (res.gone) {
+            gone.add(id);
+          } else {
+            invalid.set(id, `net:${res.error || res.status}`);
+          }
+          await sleep(delayMs);
+        }
+      }));
+    }
   }
 
   save();
-  const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
-  const failed = invalid.size;
-  const gap = report.unaccounted + failed;
-  console.log(`${tag} 完成: ${JSON.stringify({ assigned: report.assigned, found: report.found, gone: report.gone, invalid: report.invalid, unaccounted: report.unaccounted, gap, elapsedSec: report.elapsedSec })}`);
-  if (assigned.length > 0 && gap / assigned.length > 0.005) {
-    console.error(`${tag} 失败：缺口 ${gap}/${assigned.length}（未解释 ${report.unaccounted} + 失败/异常 ${failed}）超过 0.5% 阈值！`);
+  const gap = items.length - found.size - gone.size;
+  console.log(`[shard ${shard} part ${part}] 完成: assigned=${items.length} found=${found.size} gone=${gone.size} invalid=${invalid.size} gap=${gap}`);
+  if (items.length > 0 && gap / items.length > 0.005) {
+    console.error(`[shard ${shard} part ${part}] 失败: 缺口比例超过 0.5%`);
     process.exit(1);
   }
 }
 
-main().catch((e) => { console.error('FATAL:', e); process.exit(1); });
+if (process.argv[1] && import.meta.url === new URL(process.argv[1], 'file:').href) {
+  main().catch((e) => {
+    console.error('FATAL:', e);
+    process.exit(1);
+  });
+}
