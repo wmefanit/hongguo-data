@@ -80,6 +80,7 @@ async function main() {
   fs.writeFileSync(path.join(baselineDir, 'source_manifest.json.gz'), baseManifestGz);
 
   // 2. 构造今天 26 个 Sitemap（删 10 部，改 20 部，新增 30 部）
+  // 注入跨 Sitemap 重复 ID 与不同 lastmod（真实官网常态），检验归一化自愈
   const currentEntries = [];
   for (let i = 1; i <= 1000; i++) {
     if (i <= 10) continue; // 删除 1..10
@@ -91,6 +92,10 @@ async function main() {
     const id = `7600000000000000${String(i).padStart(3, '0')}`;
     currentEntries.push({ id, mod: '2026-10-02T12:00:00+08:00' });
   }
+
+  // 跨分片追加 2 条已存在 ID 的旧记录，验证 Planner 会自动按最新 lastmod 去重，不重复抓取也不抛错
+  currentEntries.push({ id: '7600000000000000015', mod: '2026-09-01T00:00:00+08:00' });
+  currentEntries.push({ id: '7600000000000000025', mod: '2026-09-01T00:00:00+08:00' });
 
   // 3. 启动 Mock 上游服务（提供 Sitemap 与 Player SSR loader 响应）
   let upstreamRequests = 0;

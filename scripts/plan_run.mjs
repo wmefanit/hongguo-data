@@ -58,41 +58,54 @@ export function buildPlan({ sitemaps, baselineManifest, parts = 4, mode = 'incre
   const isFull = mode === 'full' || !baselineManifest;
   const baselineEntries = new Map(baselineManifest ? baselineManifest.entries.map(([id, mod, st]) => [id, { lastmod: mod, status: st }]) : []);
   const allCurrent = new Map();
-  const currentManifestEntries = [];
-  const shards = [];
 
   for (const item of sitemaps) {
     const shard = item.shard;
-    const shardEntries = item.entries;
-    const partBuckets = Array.from({ length: parts }, () => []);
-    let fetchCount = 0;
-    let reuseCount = 0;
-
-    for (const [id, lastmod] of shardEntries) {
-      if (allCurrent.has(id)) throw new Error(`跨分片重复 ID: ${id}`);
-      allCurrent.set(id, { shard, lastmod });
-      currentManifestEntries.push([id, lastmod, 'ok']);
-      const base = baselineEntries.get(id);
-      const needFetch = isFull || !base || base.lastmod !== lastmod || base.status !== 'ok';
-      const part = partForId(id, parts);
-      if (needFetch) {
-        partBuckets[part].push({ id, lastmod });
-        fetchCount++;
-      } else {
-        reuseCount++;
+    for (const [id, lastmod] of item.entries) {
+      const prev = allCurrent.get(id);
+      if (!prev || String(lastmod).localeCompare(String(prev.lastmod)) > 0) {
+        allCurrent.set(id, { shard, lastmod });
       }
     }
+  }
 
+  const currentManifestEntries = [];
+  const shardBuckets = new Map();
+  for (let s = 1; s <= 26; s++) {
+    shardBuckets.set(s, {
+      total: 0,
+      fetch_count: 0,
+      reuse_count: 0,
+      parts: Array.from({ length: parts }, (_, part) => ({ part, fetch_count: 0, items: [] })),
+    });
+  }
+
+  for (const [id, { shard, lastmod }] of allCurrent.entries()) {
+    currentManifestEntries.push([id, lastmod, 'ok']);
+    const base = baselineEntries.get(id);
+    const needFetch = isFull || !base || base.lastmod !== lastmod || base.status !== 'ok';
+    const part = partForId(id, parts);
+    const sBucket = shardBuckets.get(shard);
+    sBucket.total++;
+
+    if (needFetch) {
+      sBucket.fetch_count++;
+      sBucket.parts[part].fetch_count++;
+      sBucket.parts[part].items.push({ id, lastmod });
+    } else {
+      sBucket.reuse_count++;
+    }
+  }
+
+  const shards = [];
+  for (let s = 1; s <= 26; s++) {
+    const bucket = shardBuckets.get(s);
     shards.push({
-      shard,
-      total: shardEntries.size,
-      fetch_count: fetchCount,
-      reuse_count: reuseCount,
-      parts: partBuckets.map((items, part) => ({
-        part,
-        fetch_count: items.length,
-        items,
-      })),
+      shard: s,
+      total: bucket.total,
+      fetch_count: bucket.fetch_count,
+      reuse_count: bucket.reuse_count,
+      parts: bucket.parts,
     });
   }
 
