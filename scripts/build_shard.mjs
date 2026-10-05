@@ -20,7 +20,7 @@ function num(v, def) {
   return Number.isFinite(Number(v)) ? Number(v) : def;
 }
 
-async function fetchText(url, { tries = 4, timeoutMs = 15000 } = {}) {
+async function fetchText(url, { tries = 5, timeoutMs = 20000 } = {}) {
   let last = '';
   for (let i = 0; i < tries; i++) {
     try {
@@ -32,14 +32,14 @@ async function fetchText(url, { tries = 4, timeoutMs = 15000 } = {}) {
       if (resp.status === 429 || resp.status >= 500) {
         last = `HTTP ${resp.status}`;
         const ra = Number(resp.headers.get('retry-after') || 0);
-        await sleep(Math.min(30000, Math.max(2000, ra * 1000) * (i + 1)));
+        await sleep(Math.min(45000, Math.max(3000, ra * 1000) * (i + 1)));
         continue;
       }
       if (!resp.ok) return { ok: false, status: resp.status, error: `HTTP ${resp.status}` };
       return { ok: true, text: await resp.text(), status: resp.status };
     } catch (e) {
       last = String(e && e.message || e);
-      await sleep(1000 * (i + 1));
+      await sleep(1500 * (i + 1));
     }
   }
   return { ok: false, error: last || 'fetch failed' };
@@ -164,19 +164,20 @@ async function main() {
 
   if (pending.length > 0) {
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
-    // 网络错误集中重试一次
-    const netFailed = [...invalid].filter(([, r]) => String(r).startsWith('net:'));
-    if (netFailed.length > 0) {
-      console.log(`[shard ${shard} part ${part}] 重试网络失败 ${netFailed.length} 条`);
+    // 网络错误集中重试（最多 2 轮）
+    for (let round = 1; round <= 2; round++) {
+      const netFailed = [...invalid].filter(([, r]) => String(r).startsWith('net:'));
+      if (netFailed.length === 0) break;
+      console.log(`[shard ${shard} part ${part}] 重试网络失败第 ${round} 轮: ${netFailed.length} 条`);
       for (const [id] of netFailed) invalid.delete(id);
       const retryItems = netFailed.map(([id]) => ({ id }));
       cursor = 0;
-      await Promise.all(Array.from({ length: 3 }, async () => {
+      await Promise.all(Array.from({ length: 2 }, async () => {
         for (;;) {
           const idx = cursor++;
           if (idx >= retryItems.length) return;
           const { id } = retryItems[idx];
-          const res = await fetchText(`${site}/player/${id}?__loader=player_(series_id)/page&__ssrDirect=true`, { tries: 3, timeoutMs: 15000 });
+          const res = await fetchText(`${site}/player/${id}?__loader=player_(series_id)/page&__ssrDirect=true`, { tries: 4, timeoutMs: 20000 });
           if (res.ok) {
             const parsed = parseCard(res.text, id);
             if (parsed.card) found.set(id, parsed.card);
@@ -186,7 +187,7 @@ async function main() {
           } else {
             invalid.set(id, `net:${res.error || res.status}`);
           }
-          await sleep(delayMs);
+          await sleep(delayMs * 1.5);
         }
       }));
     }
