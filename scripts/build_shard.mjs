@@ -196,8 +196,9 @@ async function main() {
   save();
   const gap = items.length - found.size - gone.size;
   console.log(`[shard ${shard} part ${part}] 完成: assigned=${items.length} found=${found.size} gone=${gone.size} invalid=${invalid.size} gap=${gap}`);
-  if (items.length > 0 && gap / items.length > 0.005) {
-    console.error(`[shard ${shard} part ${part}] 失败: 缺口比例超过 0.5%`);
+  // GHA 增量抓取时，遇到偶发下架或上游 404/500 单条坏死不应直接炸毁整个工作流
+  if (items.length > 0 && gap / items.length > 0.08 && gap > 5) {
+    console.error(`[shard ${shard} part ${part}] 失败: 缺口比例超过 8% (gap=${gap})`);
     process.exit(1);
   }
 }
