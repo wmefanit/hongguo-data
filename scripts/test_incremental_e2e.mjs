@@ -4,7 +4,7 @@
  *   1. 真实运行 plan_run.mjs（增量规划、未变识别）
  *   2. 真实运行 build_shard.mjs（只爬取规划中的 50 项，复用 970 项）
  *   3. 真实运行 merge_catalog.mjs（输出全量、Delta、Manifest、Summary）
- *   4. 真实运行 sync_catalog.mjs（Delta 应用、Hash 损坏降级全量、网络失败零坏账原子保留）
+ *   4. 真实运行 build_sqlite_catalog.mjs（Delta 应用、Hash 损坏降级全量、网络失败零坏账原子保留）
  */
 
 import fs from 'node:fs';
@@ -23,9 +23,9 @@ const testDir = '/tmp/hg_incremental_strict_e2e_v3';
 fs.rmSync(testDir, { recursive: true, force: true });
 fs.mkdirSync(testDir, { recursive: true });
 
-function run(cmd, args) {
+function run(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args);
+    const p = spawn(cmd, args, opts);
     let out = '', err = '';
     p.stdout.on('data', (d) => { out += d; });
     p.stderr.on('data', (d) => { err += d; });
@@ -36,11 +36,13 @@ function run(cmd, args) {
   });
 }
 
+let passed = 0;
 function ok(cond, title, details = '') {
   if (!cond) {
     console.error(`❌ FAIL: ${title} ${details ? '(' + details + ')' : ''}`);
     process.exit(1);
   }
+  passed++;
   console.log(`✅ PASS: ${title} ${details ? '— ' + details : ''}`);
 }
 
@@ -196,16 +198,64 @@ async function main() {
     ok(summary.catalog_total === 1020, '真实产物条目数完全正确', `1020 条`);
     ok(deltaSummary.added_count === 30 && deltaSummary.modified_count === 20 && deltaSummary.deleted_count === 10, '真实产物 Delta 增删改精准', `+30 / ~20 / -10`);
 
-    // 7. 启动 Mock Release 服务测试 Web 端 sync_catalog.mjs
+    // 6b. 审计模式（full 全量抓取 + 携带基线）也必须产出 Delta
+    //     —— 这是"周日/手动全量不再让下游退化为 80MB 全量"的核心保障，必须真实跑通
+    const auditPlanDir = path.join(testDir, 'plan_audit');
+    await run(process.execPath, [
+      '/mnt/data/code/namehere/hongguo-data/scripts/plan_run.mjs',
+      '--out-dir', auditPlanDir,
+      '--baseline-manifest', path.join(baselineDir, 'source_manifest.json.gz'),
+      '--site', upstreamBase,
+      '--parts', '4',
+      '--mode', 'full',
+    ]);
+    const auditPlan = JSON.parse(fs.readFileSync(path.join(auditPlanDir, 'plan.json'), 'utf8'));
+    ok(
+      auditPlan.mode === 'full' && auditPlan.from_tag === 'full-20261001' && auditPlan.from_catalog_hash === catalogHash(baseCatalog),
+      '审计模式 plan 仍保留 from_tag / from_catalog_hash',
+      `mode=${auditPlan.mode} from=${auditPlan.from_tag} fetch=${auditPlan.summary.total_fetch}`
+    );
+
+    const auditShardsDir = path.join(testDir, 'shards_audit');
+    for (let s = 1; s <= 26; s++) {
+      for (let p = 0; p < 4; p++) {
+        await run(process.execPath, [
+          '/mnt/data/code/namehere/hongguo-data/scripts/build_shard.mjs',
+          '--shard', String(s), '--part', String(p),
+          '--plan-file', path.join(auditPlanDir, `plan_${s}_${p}.json`),
+          '--site', upstreamBase,
+          '--out-dir', auditShardsDir,
+          '--concurrency', '4', '--delay', '5',
+        ]);
+      }
+    }
+    const auditDistDir = path.join(testDir, 'dist_audit');
+    await run(process.execPath, [
+      '/mnt/data/code/namehere/hongguo-data/scripts/merge_catalog.mjs',
+      '--plan-file', path.join(auditPlanDir, 'plan.json'),
+      '--in-dir', auditShardsDir,
+      '--out-dir', auditDistDir,
+      '--baseline-catalog', path.join(baselineDir, 'catalog.json.gz'),
+      '--to-tag', 'full-20261004',
+    ]);
+    const auditSummary = JSON.parse(fs.readFileSync(path.join(auditDistDir, 'summary.json'), 'utf8'));
+    const auditDelta = JSON.parse(fs.readFileSync(path.join(auditDistDir, 'delta.summary.json'), 'utf8'));
+    ok(auditSummary.has_delta === true, '审计模式 summary.has_delta 为 true', `has_delta=${auditSummary.has_delta}`);
+    ok(
+      auditDelta.from_tag === 'full-20261001' && auditDelta.to_tag === 'full-20261004',
+      '审计模式(full 全量抓取 + 基线)依然产出 Delta 增量包',
+      `from=${auditDelta.from_tag} to=${auditDelta.to_tag} +${auditDelta.added_count}/~${auditDelta.modified_count}/-${auditDelta.deleted_count}`
+    );
+
+    // 7. 启动 Mock Release 服务测试 Web 端 build_sqlite_catalog.mjs
     const webDataDir = path.join(testDir, 'web_data');
     fs.mkdirSync(webDataDir, { recursive: true });
-    fs.copyFileSync(path.join(baselineDir, 'catalog.json.gz'), path.join(webDataDir, 'catalog.full.json.gz'));
-    fs.writeFileSync(path.join(webDataDir, 'catalog.full.summary.json'), JSON.stringify({
-      schema: 2,
-      tag: 'full-20261001',
-      catalog_total: 1000,
-      catalog_hash: catalogHash(baseCatalog),
-    }));
+    const dbPath = path.join(webDataDir, 'hongguo_catalog.db');
+    // 初始化本地 SQLite 处于基线状态（1000 部，版本 hash 对齐 baseCatalog）
+    const { CatalogDatabase } = await import('/mnt/data/code/namehere/hongguo-web/lib/catalog_db.js');
+    let initDb = new CatalogDatabase(dbPath);
+    initDb.rebuildAll(baseCatalog, { hash: catalogHash(baseCatalog), tag: 'full-20261001' });
+    try { initDb.db.close(); } catch {}
 
     let mockReleaseFailMode = null; // null | 'corrupt_delta' | 'all_fail'
     const releaseServer = http.createServer((req, res) => {
@@ -233,41 +283,51 @@ async function main() {
     await new Promise((resolve) => releaseServer.listen(0, '127.0.0.1', resolve));
     const releasePort = releaseServer.address().port;
     const releaseBase = `http://127.0.0.1:${releasePort}`;
-    const syncScript = '/mnt/data/code/namehere/hongguo-web/scripts/sync_catalog.mjs';
+    const buildSqliteScript = '/mnt/data/code/namehere/hongguo-web/scripts/build_sqlite_catalog.mjs';
 
     try {
-      // 7a. 正常增量同步
-      await run(process.execPath, [syncScript, '--base-url', releaseBase, '--out-dir', webDataDir, '--min-count', '10']);
+      // 7a. 正常增量同步（使用真实 build_sqlite_catalog.mjs，落地 SQLite + FTS）
+      await run(process.execPath, [buildSqliteScript], {
+        env: { ...process.env, HG_DB_PATH: dbPath, HG_RELEASE_BASE: releaseBase },
+      });
       const webSum1 = JSON.parse(fs.readFileSync(path.join(webDataDir, 'catalog.full.summary.json'), 'utf8'));
-      ok(webSum1.sync_mode === 'delta' && webSum1.catalog_total === 1020, 'Web 端真实拉取 Delta 并完成原子打补丁', `mode=${webSum1.sync_mode} count=${webSum1.catalog_total}`);
+      ok(webSum1.sync_mode === 'delta' && webSum1.catalog_total === 1020, 'Web 端真实拉取 Delta 并完成原子落库', `mode=${webSum1.sync_mode} count=${webSum1.catalog_total}`);
 
       // 7b. Delta 损坏时平滑回退下载全量
       mockReleaseFailMode = 'corrupt_delta';
-      // 重新置为基线状态
-      fs.copyFileSync(path.join(baselineDir, 'catalog.json.gz'), path.join(webDataDir, 'catalog.full.json.gz'));
-      fs.writeFileSync(path.join(webDataDir, 'catalog.full.summary.json'), JSON.stringify({
-        schema: 2,
-        tag: 'full-20261001',
-        catalog_total: 1000,
-        catalog_hash: catalogHash(baseCatalog),
-      }));
-      await run(process.execPath, [syncScript, '--base-url', releaseBase, '--out-dir', webDataDir, '--min-count', '10']);
-      const webSum2 = JSON.parse(fs.readFileSync(path.join(webDataDir, 'catalog.full.summary.json'), 'utf8'));
-      ok(webSum2.sync_mode === 'full' && webSum2.catalog_total === 1020, 'Delta 损坏时自动平滑回退全量包', `mode=${webSum2.sync_mode} count=${webSum2.catalog_total}`);
+      // 重置本地 SQLite 回基线状态
+      initDb = new CatalogDatabase(dbPath);
+      initDb.rebuildAll(baseCatalog, { hash: catalogHash(baseCatalog), tag: 'full-20261001' });
+      try { initDb.db.close(); } catch {}
 
-      // 7c. 全部下载失败时保证本地旧文件绝对不被破坏（零坏账）
+      await run(process.execPath, [buildSqliteScript], {
+        env: { ...process.env, HG_DB_PATH: dbPath, HG_RELEASE_BASE: releaseBase },
+      });
+      const webSum2 = JSON.parse(fs.readFileSync(path.join(webDataDir, 'catalog.full.summary.json'), 'utf8'));
+      ok(webSum2.sync_mode === 'full-fallback' && webSum2.catalog_total === 1020, 'Delta 损坏时自动平滑回退全量包（诚实标记 full-fallback）', `mode=${webSum2.sync_mode} count=${webSum2.catalog_total}`);
+
+      // 7c. 全部下载失败时保证本地旧数据绝对不被破坏（零坏账）
       mockReleaseFailMode = 'all_fail';
-      const beforeStat = fs.statSync(path.join(webDataDir, 'catalog.full.json.gz'));
+      const beforeDb = new CatalogDatabase(dbPath);
+      const beforeCount = beforeDb.count();
+      const beforeHash = beforeDb.getMeta('catalog:hash');
+      try { beforeDb.db.close(); } catch {}
+
       let syncFailed = false;
       try {
-        await run(process.execPath, [syncScript, '--base-url', releaseBase, '--out-dir', webDataDir, '--min-count', '10']);
+        await run(process.execPath, [buildSqliteScript], {
+          env: { ...process.env, HG_DB_PATH: dbPath, HG_RELEASE_BASE: releaseBase },
+        });
       } catch {
         syncFailed = true;
       }
-      const afterStat = fs.statSync(path.join(webDataDir, 'catalog.full.json.gz'));
-      ok(syncFailed && beforeStat.size === afterStat.size, '网络完全失败时保留旧索引文件不变，零坏账', `size=${afterStat.size}`);
+      const afterDb = new CatalogDatabase(dbPath);
+      const afterCount = afterDb.count();
+      const afterHash = afterDb.getMeta('catalog:hash');
+      try { afterDb.db.close(); } catch {}
+      ok(syncFailed && beforeCount === afterCount && beforeHash === afterHash, '网络完全失败时保留旧 SQLite 库不变，零坏账', `count=${afterCount}`);
 
-      console.log('\n🎉 ALL_END_TO_END_REAL_UPSTREAM_TESTS_PASS: 8 项真实子进程/HTTP 交互测试全部通过！');
+      console.log(`\n🎉 ALL_END_TO_END_REAL_UPSTREAM_TESTS_PASS: ${passed} 项真实子进程/HTTP 交互测试全部通过！`);
     } finally {
       releaseServer.close();
     }

@@ -50,10 +50,10 @@ jobs:
           mkdir -p baseline
           MODE="${{ github.event.inputs.mode || 'incremental' }}"
           DOW=$(date -u +%w)
+          IS_AUDIT=false
           if [ "$MODE" = "full" ] || [ "$DOW" = "0" ]; then
-            echo "全量审计构建 (mode=$MODE, dow=$DOW)"
-            echo "has_baseline=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "全量审计构建 (mode=$MODE, dow=$DOW) — 全量抓取修偏，但仍拉取基线以生成 Delta 增量包"
+            IS_AUDIT=true
           fi
 
           LATEST_TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
@@ -62,13 +62,16 @@ jobs:
             if gh release download "$LATEST_TAG" --repo "$GITHUB_REPOSITORY" --pattern "source_manifest.json.gz" --pattern "catalog.json.gz" --dir baseline --clobber; then
               echo "has_baseline=true" >> "$GITHUB_OUTPUT"
               echo "from_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+              echo "is_audit=$IS_AUDIT" >> "$GITHUB_OUTPUT"
             else
-              echo "拉取基线失败，回退全量"
+              echo "拉取基线失败，首次/回退无基线全量"
               echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+              echo "is_audit=true" >> "$GITHUB_OUTPUT"
             fi
           else
             echo "未找到 Release，首次全量构建"
             echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+            echo "is_audit=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Run Planner
@@ -77,7 +80,12 @@ jobs:
           mkdir -p plan_out
           ARGS="--out-dir plan_out --parts 4"
           if [ "${{ steps.base.outputs.has_baseline }}" = "true" ] && [ -f "baseline/source_manifest.json.gz" ]; then
-            ARGS="$ARGS --baseline-manifest baseline/source_manifest.json.gz --mode incremental"
+            if [ "${{ steps.base.outputs.is_audit }}" = "true" ]; then
+              # 审计构建：全量抓取修偏，但携带 baseline-manifest 以记录 from_tag / from_catalog_hash，使合表时能生成 Delta
+              ARGS="$ARGS --baseline-manifest baseline/source_manifest.json.gz --mode full"
+            else
+              ARGS="$ARGS --baseline-manifest baseline/source_manifest.json.gz --mode incremental"
+            fi
           else
             ARGS="$ARGS --mode full"
           fi

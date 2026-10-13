@@ -165,9 +165,9 @@ async function main() {
   fs.writeFileSync(path.join(outDir, 'source_manifest.json'), manifestBytes);
   await writeGzipFile(path.join(outDir, 'source_manifest.json.gz'), manifestBytes);
 
-  // 输出 Delta
+  // 输出 Delta（只要有上一版基线就产出，无论本次抓取是否为全量审计/强制全量，确保下游永远能走增量）
   let deltaSummary = null;
-  if (baselineCatalog && plan.mode !== 'full') {
+  if (baselineCatalog) {
     const baseHash = catalogHash(baselineCatalog);
     const delta = diffCatalogs(baselineCatalog, finalCatalog, {
       fromTag: plan.from_tag,

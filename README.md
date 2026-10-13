@@ -20,7 +20,7 @@
 
 ## 获取最新数据
 
-- **增量优先（推荐）**：Web 服务同步脚本 `sync_catalog.mjs` 会优先检查并下载 `catalog.delta.json.gz`（~1-3 MB）在内存打补丁。
+- **增量优先（推荐）**：Web 服务同步脚本 `build_sqlite_catalog.mjs` 会优先检查并下载 `catalog.delta.json.gz`（~1-3 MB）直接落库 SQLite。
 - **全量下载**：直接从 Releases 下载 `catalog.json.gz`（~80 MB）：
 
 ```bash
