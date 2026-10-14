@@ -81,7 +81,8 @@ async function main() {
   fs.writeFileSync(path.join(baselineDir, 'catalog.json.gz'), baseGz);
   fs.writeFileSync(path.join(baselineDir, 'source_manifest.json.gz'), baseManifestGz);
 
-  // 2. 构造今天 26 个 Sitemap（删 10 部，改 20 部，新增 30 部）
+  // 2. 构造今天的 Sitemap 条目（删 10 部，改 20 部，新增 30 部）
+  // 注意：分片划分在下方 Mock 服务中按 SHARD_IDS 动态切分，此处只维护全量条目
   // 注入跨 Sitemap 重复 ID 与不同 lastmod（真实官网常态），检验归一化自愈
   const currentEntries = [];
   for (let i = 1; i <= 1000; i++) {
@@ -99,17 +100,29 @@ async function main() {
   currentEntries.push({ id: '7600000000000000015', mod: '2026-09-01T00:00:00+08:00' });
   currentEntries.push({ id: '7600000000000000025', mod: '2026-09-01T00:00:00+08:00' });
 
-  // 3. 启动 Mock 上游服务（提供 Sitemap 与 Player SSR loader 响应）
+  // 3. 启动 Mock 上游服务（提供 Sitemap 总索引、分片与 Player SSR loader 响应）
+  // 故意用【非 26、非连续】的分片集（含 28/30），证明规划器读的是索引而非任何写死值：
+  // 若代码仍写死 1..26，会漏掉 28/30、并多拉不存在的 3/5/6…，本测试即失败。
+  const SHARD_IDS = [1, 2, 4, 7, 11, 16, 22, 28, 30];
   let upstreamRequests = 0;
   const requestedPlayerIds = new Set();
 
   const upstreamServer = http.createServer((req, res) => {
     upstreamRequests++;
     const url = new URL(req.url, 'http://localhost');
+    if (url.pathname === '/sitemap/hongguoduanju/index.xml') {
+      const host = `http://${req.headers.host}`;
+      const xml = `<?xml version="1.0" encoding="UTF-8"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` +
+        SHARD_IDS.map((s) => `<sitemap><loc>${host}/sitemap/hongguoduanju/index${s}.xml</loc><lastmod>2026-10-02T12:00:00+08:00</lastmod></sitemap>`).join('') +
+        `</sitemapindex>`;
+      res.writeHead(200, { 'Content-Type': 'application/xml' });
+      res.end(xml);
+      return;
+    }
     const sitemapMatch = url.pathname.match(/^\/sitemap\/hongguoduanju\/index(\d+)\.xml$/);
     if (sitemapMatch) {
       const s = Number(sitemapMatch[1]);
-      const slice = currentEntries.filter((_, idx) => idx % 26 === s - 1);
+      const slice = currentEntries.filter((_, idx) => SHARD_IDS[idx % SHARD_IDS.length] === s);
       const xml = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` +
         slice.map((it) => `<url><loc>https://hongguoduanju.com/player/${it.id}</loc><lastmod>${it.mod}</lastmod></url>`).join('') +
         `</urlset>`;
@@ -161,10 +174,15 @@ async function main() {
 
     const plan = JSON.parse(fs.readFileSync(path.join(planDir, 'plan.json'), 'utf8'));
     ok(plan.summary.total_fetch === 50, '真实上游下 Planner 精确规划 50 项任务', `fetch=${plan.summary.total_fetch}`);
+    ok(
+      Array.isArray(plan.shard_ids) && JSON.stringify(plan.shard_ids) === JSON.stringify(SHARD_IDS),
+      'Planner 从总索引动态发现全部分片（非写死 26）',
+      `shard_ids=[${plan.shard_ids}]`
+    );
 
-    // 5. 执行真实 build_shard.mjs（所有 26 分片 × 4 parts）
+    // 5. 执行真实 build_shard.mjs（按索引发现的全部分片 × 4 parts）
     const shardsDir = path.join(testDir, 'shards');
-    for (let s = 1; s <= 26; s++) {
+    for (const s of SHARD_IDS) {
       for (let p = 0; p < 4; p++) {
         const planFile = path.join(planDir, `plan_${s}_${p}.json`);
         await run(process.execPath, [
@@ -217,7 +235,7 @@ async function main() {
     );
 
     const auditShardsDir = path.join(testDir, 'shards_audit');
-    for (let s = 1; s <= 26; s++) {
+    for (const s of SHARD_IDS) {
       for (let p = 0; p < 4; p++) {
         await run(process.execPath, [
           '/mnt/data/code/namehere/hongguo-data/scripts/build_shard.mjs',

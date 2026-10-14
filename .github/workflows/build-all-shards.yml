@@ -35,6 +35,7 @@ jobs:
       unchanged: ${{ steps.plan_step.outputs.unchanged }}
       from_tag: ${{ steps.plan_step.outputs.from_tag }}
       has_baseline: ${{ steps.plan_step.outputs.has_baseline }}
+      shards: ${{ steps.plan_step.outputs.shards }}
     steps:
       - uses: actions/checkout@v4
 
@@ -94,9 +95,11 @@ jobs:
           MODE=$(node -p "require('./plan_out/plan.json').mode")
           UNCHANGED=$(node -p "require('./plan_out/plan.json').unchanged")
           FROM_TAG=$(node -p "require('./plan_out/plan.json').from_tag || ''")
+          SHARDS=$(node -p "JSON.stringify(require('./plan_out/plan.json').shard_ids)")
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "unchanged=$UNCHANGED" >> "$GITHUB_OUTPUT"
           echo "from_tag=$FROM_TAG" >> "$GITHUB_OUTPUT"
+          echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
           echo "has_baseline=${{ steps.base.outputs.has_baseline }}" >> "$GITHUB_OUTPUT"
 
       - name: Upload plan artifact
@@ -122,7 +125,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+        # 分片列表由 plan job 动态输出（源自上游 Sitemap 总索引），上游扩容自动跟随，不再写死
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
         part: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4

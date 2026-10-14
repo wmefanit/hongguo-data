@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * plan_run.mjs — 抓取前置规划器
- * 读取 26 个 Sitemap，比对上一版 source manifest，只输出待抓取的新增/变更 ID。
+ * 读取总索引动态发现的全部分片，比对上一版 source manifest，只输出待抓取的新增/变更 ID。
  */
 
 import fs from 'node:fs';
@@ -10,6 +10,7 @@ import { gunzipSync } from 'node:zlib';
 import {
   CATALOG_SCHEMA,
   parseSitemapEntries,
+  parseSitemapIndex,
   partForId,
   validateSourceManifest,
   sourceHash,
@@ -36,8 +37,15 @@ async function fetchText(url, tries = 4) {
 }
 
 async function loadSitemaps(sitemapDir, site) {
+  // 分片列表唯一真理源：上游 Sitemap 总索引。索引拉取失败直接抛错（fail-fast），
+  // 绝不回退到写死的分片数，宁可本轮不跑，也不静默漏抓。
+  const indexXml = sitemapDir
+    ? fs.readFileSync(path.join(sitemapDir, 'index.xml'), 'utf8')
+    : await fetchText(`${site}/sitemap/hongguoduanju/index.xml`);
+  const shardIds = parseSitemapIndex(indexXml);
+
   const sitemaps = [];
-  for (let s = 1; s <= 26; s++) {
+  for (const s of shardIds) {
     const text = sitemapDir
       ? fs.readFileSync(path.join(sitemapDir, `index${s}.xml`), 'utf8')
       : await fetchText(`${site}/sitemap/hongguoduanju/index${s}.xml`);
@@ -69,9 +77,10 @@ export function buildPlan({ sitemaps, baselineManifest, parts = 4, mode = 'incre
     }
   }
 
+  const shardIds = sitemaps.map((item) => item.shard);
   const currentManifestEntries = [];
   const shardBuckets = new Map();
-  for (let s = 1; s <= 26; s++) {
+  for (const s of shardIds) {
     shardBuckets.set(s, {
       total: 0,
       fetch_count: 0,
@@ -98,7 +107,7 @@ export function buildPlan({ sitemaps, baselineManifest, parts = 4, mode = 'incre
   }
 
   const shards = [];
-  for (let s = 1; s <= 26; s++) {
+  for (const s of shardIds) {
     const bucket = shardBuckets.get(s);
     shards.push({
       shard: s,
@@ -131,6 +140,7 @@ export function buildPlan({ sitemaps, baselineManifest, parts = 4, mode = 'incre
       total_reuse: totalReuse,
     },
     sitemap_entries: sitemapEntriesSorted,
+    shard_ids: shardIds,
     shards,
   };
 }
@@ -155,7 +165,7 @@ async function main() {
       fs.writeFileSync(path.join(outDir, `plan_${s.shard}_${p.part}.json`), JSON.stringify(p, null, 2));
     }
   }
-  console.log(`[Plan] 规划完成: unique=${plan.summary.sitemap_unique_total}, fetch=${plan.summary.total_fetch}, reuse=${plan.summary.total_reuse}, unchanged=${plan.unchanged}`);
+  console.log(`[Plan] 规划完成: shards=${plan.shard_ids.length} [${plan.shard_ids.join(',')}], unique=${plan.summary.sitemap_unique_total}, fetch=${plan.summary.total_fetch}, reuse=${plan.summary.total_reuse}, unchanged=${plan.unchanged}`);
 }
 
 if (process.argv[1] && import.meta.url === new URL(process.argv[1], 'file:').href) {

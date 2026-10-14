@@ -5,13 +5,13 @@
 ## 核心架构与增量流水线
 
 ```
-上游 Sitemap (26 个 XML)
+上游 Sitemap 总索引 index.xml (动态发现分片，当前 28 片)
    │
-   ├──> plan_run.mjs (读取云端基线 source_manifest，比对 lastmod)
+   ├──> plan_run.mjs (读取总索引得全部分片 + 云端基线 source_manifest，比对 lastmod)
    │       ├── unchanged=true ──> 提前终止，0 抓取
    │       └── unchanged=false ──> 生成精准 plan_<shard>_<part>.json
    │
-   ├──> build_shard.mjs (26 矩阵分片并行，只抓取规划内变动 ID)
+   ├──> build_shard.mjs (按索引发现的全部分片矩阵并行，只抓取规划内变动 ID)
    │
    └──> merge_catalog.mjs (基线复用 + 严格归因 + 生成 Delta + SHA256)
            ├── catalog.json.gz (全量索引)

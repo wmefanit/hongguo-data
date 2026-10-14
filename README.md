@@ -4,7 +4,7 @@
 
 ## 数据规格
 
-- **数据源**：官方 Sitemap 全部 26 个分片（去重唯一 ID **546,830 部**，约 55 万部）
+- **数据源**：官方 Sitemap 全部分片（分片数由总索引 `sitemap/hongguoduanju/index.xml` 动态发现，当前 28 片；去重唯一 ID 约 57.5 万部）
 - **抓取端点**：`https://hongguoduanju.com/player/<id>?__loader=player_(series_id)/page&__ssrDirect=true`
 - **单条字段**：
   - `id`：剧集唯一 ID（雪花 ID 字符串）
