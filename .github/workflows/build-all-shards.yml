@@ -170,7 +170,10 @@ jobs:
     # 单分片失败不应阻断发布：只要 plan 成功且有变更，就照常合并。
     # 数据缺口由 merge 内部的全局 0.5% 阈值把关，而不是由 job 依赖关系把关——
     # 否则 114 个分片里 1 个失败就会让另外 99 个成功分片的数据全部作废。
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.unchanged != 'true'
+    # 用 !cancelled() 而非 always()：always() 在 workflow 被取消时仍返回 true，
+    # 会导致手动取消后 merge 照样执行、拿残缺产物合并并发布 Release。
+    # !cancelled() 保留「依赖失败仍合并」的原意，但取消即中止。
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.unchanged != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
