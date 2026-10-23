@@ -26,6 +26,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-full-catalog
+  cancel-in-progress: false
+
 jobs:
   plan:
     runs-on: ubuntu-latest
