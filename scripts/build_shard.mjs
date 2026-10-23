@@ -6,6 +6,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { normalizeCover, safeDate, normalizeCard } from '../lib/catalog_util.js';
+import { fetchText as httpFetchText, createBreaker } from '../lib/http.mjs';
 
 const SITE = 'https://hongguoduanju.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -20,29 +21,23 @@ function num(v, def) {
   return Number.isFinite(Number(v)) ? Number(v) : def;
 }
 
-async function fetchText(url, { tries = 5, timeoutMs = 20000 } = {}) {
-  let last = '';
-  for (let i = 0; i < tries; i++) {
-    try {
-      const resp = await fetch(url, {
-        headers: { 'User-Agent': UA, 'Accept': '*/*', 'Referer': SITE + '/' },
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (resp.status === 404 || resp.status === 410) return { ok: false, gone: true, status: resp.status };
-      if (resp.status === 429 || resp.status >= 500) {
-        last = `HTTP ${resp.status}`;
-        const ra = Number(resp.headers.get('retry-after') || 0);
-        await sleep(Math.min(45000, Math.max(3000, ra * 1000) * (i + 1)));
-        continue;
-      }
-      if (!resp.ok) return { ok: false, status: resp.status, error: `HTTP ${resp.status}` };
-      return { ok: true, text: await resp.text(), status: resp.status };
-    } catch (e) {
-      last = String(e && e.message || e);
-      await sleep(1500 * (i + 1));
-    }
-  }
-  return { ok: false, error: last || 'fetch failed' };
+// 语义层可重试：WAF 常以 200 返回 HTML 挑战页或空壳 JSON，
+// 若当成「数据不存在」永久判死，就再也抓不回来了。这类必须重试。
+const RETRYABLE_SEMANTIC = new Set(['bad_payload', 'loader_fail', 'no_seriesDetail']);
+
+let breaker = null;
+let deadlineAt = 0;
+let backoffBaseMs = 2000;
+const expired = () => deadlineAt > 0 && Date.now() > deadlineAt;
+
+function fetchText(url, opts = {}) {
+  return httpFetchText(url, {
+    headers: { 'User-Agent': UA, 'Accept': '*/*', 'Referer': SITE + '/' },
+    breaker,
+    expired,
+    backoffBase: backoffBaseMs,
+    ...opts,
+  });
 }
 
 function parseCard(text, id) {
@@ -81,7 +76,20 @@ async function main() {
   const limit = num(arg('--limit', 0), 0);
   const site = arg('--site', SITE).replace(/\/$/, '');
   const outDir = path.resolve(arg('--out-dir', './shards'));
+  const maxRuntimeMin = num(arg('--max-runtime', 40), 40);
+  backoffBaseMs = num(arg('--backoff-base', 2000), 2000);
   fs.mkdirSync(outDir, { recursive: true });
+
+  // 全局熔断：被 WAF 限流时所有 worker 一起退避，避免并发猛撞把封禁窗口越拉越长。
+  breaker = createBreaker({
+    window: num(arg('--breaker-window', 20), 20),
+    ratio: num(arg('--breaker-ratio', 0.5), 0.5),
+    baseMs: num(arg('--breaker-base', 15000), 15000),
+    maxMs: num(arg('--breaker-max', 120000), 120000),
+    log: (m) => console.log(`[shard ${shard} part ${part}] ${m}`),
+  });
+  // 自带 deadline：到点收工落盘，把已抓数据完整交出，不给 CI job 超时杀进程的机会。
+  deadlineAt = maxRuntimeMin > 0 ? Date.now() + maxRuntimeMin * 60000 : 0;
 
   if (!fs.existsSync(planFile)) {
     throw new Error(`找不到 plan 文件: ${planFile}`);
@@ -121,6 +129,7 @@ async function main() {
   let cursor = 0;
   const started = Date.now();
   let lastSave = Date.now();
+  let deadlineHit = false;
 
   const save = () => {
     fs.writeFileSync(outFile, JSON.stringify([...found.values()]));
@@ -132,6 +141,7 @@ async function main() {
       gone: gone.size,
       invalid: invalid.size,
       unaccounted: items.length - found.size - gone.size - invalid.size,
+      deadlineHit,
       goneIds: [...gone],
       invalidIds: [...invalid].map(([id, reason]) => ({ id, reason })),
       elapsedSec: Math.round((Date.now() - started) / 1000),
@@ -141,6 +151,7 @@ async function main() {
 
   const worker = async () => {
     for (;;) {
+      if (expired()) { deadlineHit = true; return; }
       const i = cursor++;
       if (i >= pending.length) return;
       const { id } = pending[i];
@@ -164,16 +175,21 @@ async function main() {
 
   if (pending.length > 0) {
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
-    // 网络错误集中重试（最多 2 轮）
+    // 失败集中重试（最多 2 轮）：既含网络/限流失败，也含 WAF 挑战页等语义失败。
     for (let round = 1; round <= 2; round++) {
-      const netFailed = [...invalid].filter(([, r]) => String(r).startsWith('net:'));
-      if (netFailed.length === 0) break;
-      console.log(`[shard ${shard} part ${part}] 重试网络失败第 ${round} 轮: ${netFailed.length} 条`);
-      for (const [id] of netFailed) invalid.delete(id);
-      const retryItems = netFailed.map(([id]) => ({ id }));
+      if (expired()) { deadlineHit = true; break; }
+      const retryable = [...invalid].filter(([, r]) => {
+        const s = String(r);
+        return s.startsWith('net:') || RETRYABLE_SEMANTIC.has(s);
+      });
+      if (retryable.length === 0) break;
+      console.log(`[shard ${shard} part ${part}] 重试失败项第 ${round} 轮: ${retryable.length} 条`);
+      for (const [id] of retryable) invalid.delete(id);
+      const retryItems = retryable.map(([id]) => ({ id }));
       cursor = 0;
       await Promise.all(Array.from({ length: 2 }, async () => {
         for (;;) {
+          if (expired()) { deadlineHit = true; return; }
           const idx = cursor++;
           if (idx >= retryItems.length) return;
           const { id } = retryItems[idx];
@@ -195,11 +211,18 @@ async function main() {
 
   save();
   const gap = items.length - found.size - gone.size;
-  console.log(`[shard ${shard} part ${part}] 完成: assigned=${items.length} found=${found.size} gone=${gone.size} invalid=${invalid.size} gap=${gap}`);
-  // GHA 增量抓取时，遇到偶发下架或上游 404/500 单条坏死不应直接炸毁整个工作流
-  if (items.length > 0 && gap / items.length > 0.08 && gap > 5) {
-    console.error(`[shard ${shard} part ${part}] 失败: 缺口比例超过 8% (gap=${gap})`);
-    process.exit(1);
+  const gapRatio = items.length > 0 ? gap / items.length : 0;
+  console.log(`[shard ${shard} part ${part}] 完成: assigned=${items.length} found=${found.size} gone=${gone.size} invalid=${invalid.size} gap=${gap}${deadlineHit ? ' [已到时限，提前收工]' : ''}`);
+  // 数据缺口是「业务结果」，不是「工程故障」：部分失败只告警，由 merge 阶段的全局缺口阈值统一把关。
+  // 局部 8% 阈值曾把 19.7% 的分片缺口判死，导致 99 个成功分片的数据全部无法发布。
+  if (items.length > 0 && gapRatio > 0.08 && gap > 5) {
+    if (found.size === 0 && gone.size === 0 && !deadlineHit) {
+      // 一条都没抓到且非时限原因，说明是站点级封禁/网络中断等工程故障，保留红灯供人工介入；
+      // 产物仍会照常上传，merge 由全局阈值决定是否发布，不会阻断其余分片。
+      console.error(`[shard ${shard} part ${part}] 严重失败: 全部 ${items.length} 条均未取得结果`);
+      process.exit(1);
+    }
+    console.warn(`[shard ${shard} part ${part}] 警告: 缺口比例 ${(gapRatio * 100).toFixed(1)}% (gap=${gap}/${items.length})，已记为 invalid 交由 merge 全局阈值判定`);
   }
 }
 

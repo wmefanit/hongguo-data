@@ -64,8 +64,13 @@ async function main() {
 
       const resultFile = path.join(shardsDir, `shard_${shard.shard}.part${part.part}.json`);
       const reportFile = path.join(shardsDir, `shard_${shard.shard}.part${part.part}_report.json`);
-      if (part.fetch_count > 0 && (!fs.existsSync(resultFile) || !fs.existsSync(reportFile))) {
-        throw new Error(`缺少分片抓取产物: shard=${shard.shard}, part=${part.part}`);
+      const hasResult = fs.existsSync(resultFile);
+      const hasReport = fs.existsSync(reportFile);
+      // 分片 job 崩溃/超时/产物上传失败属「数据缺口」，不是「合并逻辑错误」。
+      // 直接 throw 会让 1 个坏分片阻断其余 100+ 个成功分片的发布，故降级为 invalid，
+      // 由下方全局缺口阈值（0.5%）统一决定是否值得发布。
+      if (part.fetch_count > 0 && (!hasResult || !hasReport)) {
+        console.warn(`[Merge] 警告: 缺少分片抓取产物 shard=${shard.shard} part=${part.part} (result=${hasResult} report=${hasReport})，未归因项将标记 invalid 待下轮重抓`);
       }
 
       if (fs.existsSync(resultFile)) {
@@ -91,13 +96,32 @@ async function main() {
           invalid.set(id, it.reason);
         }
       }
+
+      // 产物缺失（分片 job 崩溃/超时/上传失败）时，该 part 内所有尚无归因的条目
+      // 统一标记为 invalid：本轮不发布这些条目，下一轮 plan 见 status!=='ok' 会自动重抓。
+      if (part.fetch_count > 0 && (!hasResult || !hasReport)) {
+        for (const item of part.items || []) {
+          const id = String(item.id);
+          if (!crawledCatalog.has(id) && !gone.has(id) && !invalid.has(id)) {
+            invalid.set(id, 'net:missing_artifact');
+          }
+        }
+      }
     }
   }
 
+  // 分片早停/崩溃/被杀会导致部分 ID 无归因。这是「数据缺口」而非「合并错误」：
+  // 标记 invalid 后本轮不发布这些条目，下一轮 plan 见 status!=='ok' 自动重抓。
+  // 全局质量仍由下方 0.5% 缺口阈值把关，不放宽标准。
+  let unaccounted = 0;
   for (const id of plannedFetch) {
     if (!crawledCatalog.has(id) && !gone.has(id) && !invalid.has(id)) {
-      throw new Error(`计划抓取 ID 没有最终结果: ${id}`);
+      invalid.set(id, 'net:unaccounted');
+      unaccounted++;
     }
+  }
+  if (unaccounted > 0) {
+    console.warn(`[Merge] 警告: ${unaccounted} 条计划抓取项无归因（分片早停/崩溃），已标记 invalid 待下轮重抓`);
   }
 
   // 2. 以当前 sitemap 作为唯一真相组装最终全量：

@@ -16,6 +16,7 @@ import {
   sourceHash,
   normalizeManifestEntries,
 } from '../lib/catalog_util.js';
+import { fetchText as httpFetchText } from '../lib/http.mjs';
 
 const SITE = 'https://hongguoduanju.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -25,15 +26,18 @@ function arg(flag, fallback) {
   return i >= 0 && process.argv[i + 1] !== undefined ? process.argv[i + 1] : fallback;
 }
 
+// 复用统一容错层：分类规则与分片抓取保持一致（404/410 终态，其余一律重试）。
+// 但语义不变——sitemap 是分片列表的唯一真理源，拉不到必须 fail-fast，
+// 绝不回退到写死的分片数，宁可本轮不跑也不静默漏抓。
 async function fetchText(url, tries = 4) {
-  for (let i = 0; i < tries; i++) {
-    try {
-      const resp = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(30000) });
-      if (resp.ok) return await resp.text();
-    } catch {}
-    await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
-  }
-  throw new Error(`下载失败: ${url}`);
+  const res = await httpFetchText(url, {
+    tries,
+    timeoutMs: 30000,
+    headers: { 'User-Agent': UA },
+    backoffBase: 1500,
+  });
+  if (res.ok) return res.text;
+  throw new Error(`下载失败: ${url} (${res.error || res.status || (res.gone ? 'gone' : 'unknown')})`);
 }
 
 async function loadSitemaps(sitemapDir, site) {
