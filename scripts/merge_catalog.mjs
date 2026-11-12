@@ -41,13 +41,22 @@ async function main() {
   const shardsDir = path.resolve(arg('--in-dir', './shards'));
   const outDir = path.resolve(arg('--out-dir', './dist'));
   const baselineCatalogPath = arg('--baseline-catalog', '');
-  const toTag = arg('--to-tag', `full-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`);
+  const toTag = arg('--to-tag', `full-${new Date().toISOString().replace(/[-:.]/g, '').replace('T', '-')}`);
   fs.mkdirSync(outDir, { recursive: true });
 
   if (!fs.existsSync(planFile)) throw new Error(`找不到 plan 文件: ${planFile}`);
   const plan = JSON.parse(fs.readFileSync(planFile, 'utf8'));
   const baselineCatalog = loadBaseline(baselineCatalogPath);
   const baselineMap = new Map((baselineCatalog || []).map((card) => [card.id, card]));
+  if (baselineCatalog) {
+    const actualBaselineHash = catalogHash(baselineCatalog);
+    if (!plan.from_catalog_hash || plan.from_catalog_hash !== actualBaselineHash) {
+      throw new Error(`[Merge 致命错误] 计划基线哈希 ${plan.from_catalog_hash || '(缺失)'} 与实际 catalog ${actualBaselineHash} 不一致，拒绝生成断链 delta`);
+    }
+    if (!plan.from_tag || plan.from_tag === toTag) {
+      throw new Error(`[Merge 致命错误] delta 起始 tag 非法/自引用: from=${plan.from_tag || '(缺失)'} to=${toTag}`);
+    }
+  }
 
   const crawledCatalog = new Map();
   const gone = new Set();

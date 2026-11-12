@@ -213,13 +213,25 @@ jobs:
           find shards_raw -type f -name "*.json" -exec cp -f {} shards/ \;
           echo "Shard files: $(ls shards/*.json | wc -l)"
 
+      - name: Prepare immutable release tag
+        id: release_tag
+        if: ${{ github.event.inputs.publish != 'false' && (github.event.inputs.limit == '0' || github.event.inputs.limit == '') }}
+        run: |
+          # 每次 workflow attempt 使用独立 tag；绝不覆盖历史 delta 的 from_tag 基线。
+          TAG="full-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "本次不可变 Release tag: $TAG"
+
       - name: Merge and generate delta
         run: |
-          ARGS="--plan-file plan/plan.json --in-dir shards --out-dir dist"
+          ARGS=(--plan-file plan/plan.json --in-dir shards --out-dir dist)
           if [ -f "baseline/catalog.json.gz" ]; then
-            ARGS="$ARGS --baseline-catalog baseline/catalog.json.gz"
+            ARGS+=(--baseline-catalog baseline/catalog.json.gz)
           fi
-          node scripts/merge_catalog.mjs $ARGS
+          if [ -n "${{ steps.release_tag.outputs.tag }}" ]; then
+            ARGS+=(--to-tag "${{ steps.release_tag.outputs.tag }}")
+          fi
+          node scripts/merge_catalog.mjs "${ARGS[@]}"
 
       - name: Upload dist artifacts
         uses: actions/upload-artifact@v4
@@ -232,15 +244,31 @@ jobs:
         if: ${{ github.event.inputs.publish != 'false' && (github.event.inputs.limit == '0' || github.event.inputs.limit == '') }}
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
         run: |
           set -e
-          TAG="full-$(date -u +%Y%m%d)"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
-          fi
+          TAG="${{ steps.release_tag.outputs.tag }}"
+          test -n "$TAG"
           TOTAL=$(node -p "require('./dist/summary.json').catalog_total")
           TIME=$(node -p "require('./dist/summary.json').updated_at")
           NOTES="红果短剧全量+增量元数据索引 ($TOTAL 部)\n生成时间: $TIME"
+
+          # 发布前再次校验本次目标 tag、增量目标与 delta 资产摘要完全一致。
+          node --input-type=module -e '
+            import { createHash } from "node:crypto";
+            import fs from "node:fs";
+            const s = JSON.parse(fs.readFileSync("dist/summary.json", "utf8"));
+            if (s.tag !== process.env.RELEASE_TAG) throw new Error(`summary tag 不一致: ${s.tag} != ${process.env.RELEASE_TAG}`);
+            if (s.has_delta) {
+              const d = JSON.parse(fs.readFileSync("dist/delta.summary.json", "utf8"));
+              const deltaGz = fs.readFileSync("dist/catalog.delta.json.gz");
+              const actualDeltaSha = createHash("sha256").update(deltaGz).digest("hex");
+              if (d.to_tag !== s.tag || d.to_catalog_hash !== s.catalog_hash) throw new Error("delta 目标与 summary 不一致");
+              if (d.from_tag === d.to_tag) throw new Error(`delta 禁止自引用 Release: ${d.from_tag}`);
+              if (d.from_catalog_hash === d.to_catalog_hash) throw new Error("delta 起终哈希相同，拒绝发布");
+              if (actualDeltaSha !== d.delta_sha256) throw new Error(`delta 资产 SHA256 不匹配: ${actualDeltaSha} != ${d.delta_sha256}`);
+            }
+          '
 
           FILES="dist/catalog.json.gz dist/summary.json dist/source_manifest.json.gz"
           if [ -f "dist/catalog.delta.json.gz" ]; then

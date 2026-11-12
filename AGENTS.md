@@ -38,3 +38,11 @@
   ```bash
   node scripts/merge_catalog.mjs --plan-file ./plan/plan.json --in-dir ./shards --out-dir ./dist --baseline-catalog ./baseline/catalog.json.gz
   ```
+
+## 发布不变量（改动发布逻辑前必读）
+
+- **Release tag 一经发布不得复用、不得删除重建**：tag 是增量链的锚点，`delta.from_tag` 指向它。
+  同一天多次构建必须产出不同 tag（`full-<日期>-<run_id>-<attempt>`），否则后一次构建会覆盖前一次的
+  目录内容，使已发布 delta 的 `from_catalog_hash` 永久失配，下游每次同步都判"链断"→ 退化成 80MB 全量。
+- `merge_catalog.mjs` 会校验「计划里的基线哈希 == 实际基线目录哈希」「delta 起始 tag ≠ 目标 tag」，
+  对不上直接失败；发布步骤会校验 summary / delta.summary / delta 资产 SHA256 三者一致。
